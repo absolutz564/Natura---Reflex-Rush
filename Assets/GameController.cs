@@ -33,6 +33,7 @@ public class GameController : MonoBehaviour
     public GameObject WinnerObject;
     public GameObject EndObject;
     public Image TimerImage;
+    public GameObject Ballsobjects;
     public TextMeshProUGUI CountText;
     public GameObject AllHideObjects;
     public Image Life;
@@ -301,6 +302,7 @@ public class GameController : MonoBehaviour
         AllHideObjects.SetActive(true);
         StartGame();
         TimerImage.gameObject.SetActive(false);
+        Ballsobjects.gameObject.SetActive(true);
     }
 
     IEnumerator GameLoop()
