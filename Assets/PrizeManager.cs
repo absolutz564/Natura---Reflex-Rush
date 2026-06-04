@@ -1,248 +1,269 @@
+using System;
+using System.Collections;
 using UnityEngine;
-using UnityEngine.UI;
-using TMPro; // Adicionar para TextMeshPro
-using System.Collections.Generic;
-// using System.Security.Cryptography; // Removido, agora está no TotemApiClient
-using System.Collections; // Adicionado para IEnumerator
-using System.Linq;
-using static TotemApiClient;
+using UnityEngine.Events;
 using UnityEngine.SceneManagement;
-using System.Collections; // Para acessar ApiTotemStockResponse e ApiTotemConfig
+using UnityEngine.UI;
+using TMPro;
 
-// A classe TotemItem precisa estar no escopo global para ser acessível pelo TotemApiClient
-// e para que o PrizeManager possa usá-la diretamente.
-[System.Serializable]
-public class TotemItem
-{
-    public string giftId;
-    public string name;
-    public int totalStock;
-    public int remaining;
-    public int minPresents; // NOVO: Mínimo de brindes coletados para este prêmio
-    public string imageUrl; // NOVO: URL da imagem do prêmio
-}
+// =====================================================================
+// PrizeManager — wrapper genérico do ApiController focado em UI de prêmio.
+// Funciona com dois fluxos:
+//
+//   A) "Cena de prêmio dedicada" (ex.: Lux/Bolhas)
+//      No GameOver do seu jogo:
+//          PrizeManager.PrepareForScore(score, duracaoSegundos);
+//          SceneManager.LoadScene("PrizeScene");
+//      Na PrizeScene tenha um GameObject com PrizeManager.autoAwardOnStart=true.
+//      Ele consome os statics, chama CompleteRound, renderiza nome/imagem.
+//
+//   B) "Tela única" (ex.: Natura Jackpot)
+//      No Start do seu jogo:
+//          PrizeManager.Instance.FetchChance(c => winChance = Mathf.RoundToInt(c.chance));
+//      Quando o jogador ganhar:
+//          PrizeManager.Instance.AwardPrize(discreteOutcome: 1);
+//      Eventos OnPrizeAwarded / OnNoPrize disparam pra você atualizar UI extra.
+//
+// Para SCORE_ENDLESS use PrepareForScore(score, duration).
+// Para JACKPOT_ROSACEA/ROLETA, passe discreteOutcome no AwardPrize.
+// =====================================================================
 
 public class PrizeManager : MonoBehaviour
 {
-    public static float LastGameDurationSeconds = 0f;
-    public static int CollectedGiftsCount = 0; // Para ser setado antes de carregar a cena EndGame
+    public enum GameTypeOption { SCORE_ENDLESS, JACKPOT_ROSACEA, ROLETA }
 
-    [Header("UI References")]
+    public static PrizeManager Instance { get; private set; }
+
+    [Header("Configuração da rodada")]
+    public GameTypeOption gameType = GameTypeOption.SCORE_ENDLESS;
+    [Tooltip("Duração default em segundos se nada for passado via PrepareFor*")]
+    public int defaultDurationSec = 30;
+    [Tooltip("Ao iniciar a cena já dispara AwardPrize com os statics preparados (fluxo A).")]
+    public bool autoAwardOnStart = false;
+
+    [Tooltip("Faz GET /round/preview em background no Start. Necessário pra resolver offline (popula cache).")]
+    public bool autoFetchPreviewOnStart = true;
+
+    [Header("UI (opcional)")]
     public Image prizeImage;
-    public TextMeshProUGUI prizeNameText; // NOVO: Referência para o TextMeshPro
-    public Sprite fallbackSprite; // Imagem de fallback para quando o cache/download falhar
+    public TextMeshProUGUI prizeNameText;
+    public Sprite fallbackSprite;
+    [Tooltip("Painel mostrado quando não há prêmio (TIER_NO_STOCK, period cap, etc.)")]
+    public GameObject noPrizePanel;
+    [Tooltip("Se preenchido e não houver prêmio, carrega essa cena.")]
+    public string noPrizeSceneName;
 
-    // O mapeamento de prêmios agora será feito diretamente com base nos TotemItems carregados.
-    // A lista prizeMap não é mais necessária, pois a lógica de minCollectedCount (agora minPresents)
-    // virá diretamente do TotemItem.
-    // Mantemos a estrutura CountPrizeMap apenas para referência, mas ela será removida.
-    // O script usará a lista TotemApiClient.Instance.StockItems.
+    [Header("Eventos")]
+    public GiftEvent OnPrizeAwarded;
+    public NoPrizeEvent OnNoPrize;
+    public ChanceEvent OnChanceLoaded;
 
-    // Estrutura para armazenar o resultado final do jogo
+    // ----- Statics pra repassar contexto entre cenas (fluxo A) -----
+    public static float LastGameDurationSeconds = 0f;
+    public static int? LastScore = null;
+    public static int? LastDiscreteOutcome = null;
 
-    // Estrutura para armazenar o resultado final do jogo
-    public static Dictionary<string, int> FinalPrizeDistribution = new Dictionary<string, int>();
+    // ----- Cache da última chance buscada (fluxo B) -----
+    public static ChanceData CurrentChance;
+    public static Gift LastAwardedGift;
+
+    void Awake()
+    {
+        // Singleton "soft" — sobrescreve em cada cena (não usa DontDestroyOnLoad
+        // porque cada cena pode ter UI própria pro prêmio).
+        Instance = this;
+
+        // UnityEvents só são inicializados automaticamente quando vêm do Inspector.
+        // Como o componente pode ser adicionado em runtime (AddComponent), garantimos aqui.
+        if (OnPrizeAwarded == null) OnPrizeAwarded = new GiftEvent();
+        if (OnNoPrize == null)     OnNoPrize     = new NoPrizeEvent();
+        if (OnChanceLoaded == null) OnChanceLoaded = new ChanceEvent();
+    }
 
     void Start()
     {
-        // Pega a contagem de brindes coletados do ClawController (setado antes de carregar a cena)
-        CollectedGiftsCount = 0;
-        DeterminePrize();
-        // StartCoroutine(WaitToReload());
+        if (autoFetchPreviewOnStart)
+            FetchPreview();
+
+        if (autoAwardOnStart)
+            AwardPrize(LastScore, LastDiscreteOutcome);
     }
 
-    IEnumerator WaitToReload() {
-        yield return new WaitForSeconds(5f);
-        SceneManager.LoadScene(0);
+    // ----------- Helpers estáticos (preparação pré-cena) -----------
+    public static void PrepareForScore(int score, float durationSeconds)
+    {
+        LastScore = score;
+        LastDiscreteOutcome = null;
+        LastGameDurationSeconds = durationSeconds;
     }
 
+    public static void PrepareForJackpot(int discreteOutcome, float durationSeconds)
+    {
+        LastDiscreteOutcome = discreteOutcome;
+        LastScore = null;
+        LastGameDurationSeconds = durationSeconds;
+    }
+
+    public static void ResetPrepared()
+    {
+        LastScore = null;
+        LastDiscreteOutcome = null;
+        LastGameDurationSeconds = 0f;
+    }
+
+    // ----------- API pública -----------
+
+    /// Busca a chance da API e atualiza CurrentChance + dispara OnChanceLoaded.
+    /// Use no Start de jogos baseados em probabilidade.
+    public void FetchChance(Action<ChanceData> done = null)
+    {
+        if (!EnsureApi()) { done?.Invoke(null); return; }
+        StartCoroutine(FetchChanceCoroutine(done));
+    }
+
+    /// Busca preview do próximo prêmio (sem consumir estoque). Útil pra UI
+    /// que mostra o "alvo" durante o jogo, ou pra pré-cachear imagem.
+    public void FetchPreview(Action<PreviewData> done = null)
+    {
+        if (!EnsureApi()) { done?.Invoke(null); return; }
+        StartCoroutine(ApiController.Instance.GetPreview(gameType.ToString(), p =>
+        {
+            if (p?.preview != null) Debug.Log($"[PrizeManager] Preview: {p.preview.candidateGiftName} ({p.preview.chancePct}%)");
+            done?.Invoke(p);
+        }));
+    }
+
+    /// Chama CompleteRound e dispara UI/eventos. Use no fim da rodada.
+    /// Para SCORE_ENDLESS passe score; para JACKPOT/ROLETA passe discreteOutcome.
+    public void AwardPrize(int? score = null, int? discreteOutcome = null)
+    {
+        if (!EnsureApi()) return;
+        StartCoroutine(AwardCoroutine(score, discreteOutcome));
+    }
+
+    /// Reinicia a cena atual (atalho usado por botões de UI).
+    /// Qualificado com namespace completo pra evitar conflito com possíveis classes "SceneManager" do projeto.
     public void ReloadScene()
     {
-        SceneManager.LoadScene(0);
+        var s = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+        UnityEngine.SceneManagement.SceneManager.LoadScene(s.buildIndex);
     }
 
-    private void DeterminePrize()
+    /// Carrega uma cena por nome (atalho pra botões).
+    public void LoadScene(string sceneName)
     {
-        TotemApiClient apiClient = TotemApiClient.Instance;
+        UnityEngine.SceneManagement.SceneManager.LoadScene(sceneName);
+    }
 
-        if (apiClient == null)
+    /// Mostra ou esconde os GameObjects de prizeImage e prizeNameText.
+    /// Útil quando win/loss compartilham o mesmo panel e só os elementos de prêmio
+    /// devem desaparecer no caso de loss.
+    public void SetPrizeUIVisible(bool visible)
+    {
+        if (prizeImage != null)    prizeImage.gameObject.SetActive(visible);
+        if (prizeNameText != null) prizeNameText.gameObject.SetActive(visible);
+    }
+
+    // ----------- Internas -----------
+
+    private IEnumerator FetchChanceCoroutine(Action<ChanceData> done)
+    {
+        yield return ApiController.Instance.GetChance(c =>
         {
-            Debug.LogError("TotemApiClient não encontrado!");
-        //    return;
-        }
+            CurrentChance = c;
+            if (c != null) Debug.Log($"[PrizeManager] Chance: {c.chance}% | cap: {c.dispensedInPeriod}/{c.periodCeiling}");
+            OnChanceLoaded?.Invoke(c);
+            done?.Invoke(c);
+        });
+    }
 
-        if (prizeImage == null)
-        {
-            Debug.LogError("Prize Image não atribuído no Inspector!");
-        //    return;
-        }
+    private IEnumerator AwardCoroutine(int? score, int? discreteOutcome)
+    {
+        float duration = LastGameDurationSeconds > 0 ? LastGameDurationSeconds : defaultDurationSec;
+        int durationSec = Mathf.Max(1, Mathf.RoundToInt(duration));
 
-        if (prizeNameText == null)
-        {
-            Debug.LogWarning("Prize Name Text (TextMeshProUGUI) não atribuído no Inspector. O nome do prêmio não será exibido.");
-            // Não retorna, apenas avisa, pois a imagem e o resto da lógica ainda podem funcionar.
-        }
-
-        // 1. Limpa o resultado anterior
-        FinalPrizeDistribution.Clear();
-
-        // 2. Verifica se algum brinde foi coletado
-        //if (CollectedGiftsCount == 0)
-        //{
-        //    Debug.Log("Nenhum brinde coletado. Não há prêmio.");
-        //    prizeImage.enabled = false;
-        //    return;
-        //}
-
-        // 3. Determina o prêmio baseado na contagem
-        // O prêmio é o que tem o maior minPresents que é <= CollectedGiftsCount
-
-        // 4. Obtém o estoque atual
-        ApiTotemStockResponse stockResponse = apiClient.GetLastStockResponse();
-
-        if (stockResponse == null || stockResponse.items == null)
-        {
-            Debug.LogError("Resposta de estoque inválida ou não carregada!");
-            return;
-        }
-
-        // Lógica de seleção: Encontra o item com o maior minPresents que é menor ou igual a CollectedGiftsCount E que está em estoque
-        // 1. Filtra todos os itens elegíveis e em estoque
-        var eligibleAndInStock = stockResponse.items
-            .Where(item => item.minPresents <= CollectedGiftsCount && item.remaining > 0)
-            .ToList();
-
-        TotemItem awardedPrize = null;
-
-        if (eligibleAndInStock.Count > 0)
-        {
-            // 2. Encontra o maior minPresents entre os elegíveis
-            int maxMinPresents = eligibleAndInStock.Max(item => item.minPresents);
-
-            // 3. Filtra a lista para incluir apenas os prêmios com o maior minPresents (o "nível" de maior elegibilidade)
-            List<TotemItem> topTierPrizes = eligibleAndInStock
-                .Where(item => item.minPresents == maxMinPresents)
-                .ToList();
-
-            // 4. Seleciona um prêmio aleatoriamente da lista de maior elegibilidade
-            int randomIndex = Random.Range(0, topTierPrizes.Count);
-            awardedPrize = topTierPrizes[randomIndex];
-        }
-        // Pega o primeiro (o maior elegível e em estoque)
-
-        if (awardedPrize == null)
-        {
-            Debug.LogWarning($"Nenhum prêmio elegível E em estoque encontrado para {CollectedGiftsCount} brindes coletados. Transicionando para GameOver.");
-            //FindObjectOfType<TransitionPlayer>().PlayTransition("GameOver");
-            SceneManager.LoadScene("GameOver");
-            return;
-        }
-
-        string awardedGiftId = awardedPrize.giftId;
-        Debug.Log($"Prêmio determinado: {awardedGiftId} (Mínimo: {awardedPrize.minPresents}, Estoque: {awardedPrize.remaining})");
-
-        // As verificações de awardedPrize == null e awardedPrize.remaining <= 0 foram movidas para o filtro LINQ.
-        // Apenas mantemos a verificação de awardedPrize == null para o caso de nenhum item ser encontrado.
-
-        // 5. O prêmio já está em estoque devido ao filtro LINQ.
-        // Removemos a verificação redundante de estoque aqui.
-
-        // 6. Registra a distribuição final (1 unidade do prêmio)
-        FinalPrizeDistribution.Add(awardedGiftId, 1);
-
-        // NOVO: Exibe o nome do prêmio
-        if (prizeNameText != null)
-        {
-            prizeNameText.text = awardedPrize.name;
-        }
-
-        // 7. Carrega a imagem do prêmio via URL (com cache local)
-        if (string.IsNullOrEmpty(awardedPrize.imageUrl))
-        {
-            Debug.LogError($"URL da imagem não encontrada para GiftID={awardedPrize.giftId}");
-            prizeImage.enabled = false;
-            return;
-        }
-
-        // Inicia a corrotina para carregar a imagem do cache
-        apiClient.StartCoroutine(LoadImageFromCache(awardedPrize.imageUrl));
-
-        Debug.Log($"🏆 Prêmio sorteado: {awardedPrize.name} (ID: {awardedPrize.giftId})");
-
-        // 8. Prepara e envia o Batch
-        // O batch deve subtrair 1 do estoque do prêmio atribuído.
-        // **NOVO**: Não atualiza o estoque localmente nem envia o batch aqui.
-        // Apenas registra a vitória no TotemApiClient para ser processada no Sync.
-        float duration = LastGameDurationSeconds > 0 ? LastGameDurationSeconds : 5f;
-
-        Debug.Log($"Registrando Vitória: GiftID={awardedPrize.giftId}, Duration={duration}s");
-
-        apiClient.RegisterWin(
-            awardedPrize.giftId,
-            duration,
-            (response) =>
+        yield return ApiController.Instance.CompleteRound(
+            gameType.ToString(),
+            score,
+            discreteOutcome,
+            durationSec,
+            data =>
             {
-                if (response.StartsWith("ERRO"))
-                    Debug.LogError("Erro ao registrar Vitória: " + response);
-                else
-                    Debug.Log("Vitória registrada com sucesso: " + response);
+                ResetPrepared();
+
+                // Servidor decide: sem gift → não há prêmio (loss/no-stock/cap atingido/etc.).
+                // O reason vem do `code` retornado pela API (TIER_NO_STOCK, PERIOD_CAP_REACHED, ...).
+                if (data == null || data.gift == null || string.IsNullOrEmpty(data.gift.id))
+                {
+                    string reason = data?.code ?? "NO_GIFT";
+                    if (!string.IsNullOrEmpty(data?.message)) reason += $" — {data.message}";
+                    HandleNoPrize(reason);
+                    return;
+                }
+
+                LastAwardedGift = data.gift;
+                DisplayPrize(data.gift, data.resolvedOffline);
+                OnPrizeAwarded?.Invoke(data.gift);
             }
         );
     }
 
-    // NOVO: Método auxiliar para aplicar a textura ao componente Image
-    private void ApplyTextureToImage(Texture2D texture)
+    private void DisplayPrize(Gift gift, bool offline)
     {
-        Sprite sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), Vector2.one * 0.5f);
-        prizeImage.sprite = sprite;
-        prizeImage.enabled = true;
-        Debug.Log("Imagem do prêmio aplicada com sucesso.");
+        if (prizeNameText != null)
+            prizeNameText.text = gift.name ?? "";
+
+        if (prizeImage == null) return;
+
+        // Sem URL na resposta — mantém fallback (alguns endpoints não devolvem imageUrl).
+        if (string.IsNullOrEmpty(gift.imageUrl))
+        {
+            ApplyFallback();
+            return;
+        }
+
+        StartCoroutine(ApiController.Instance.GetGiftImage(gift, sp =>
+        {
+            if (sp != null)
+            {
+                prizeImage.sprite = sp;
+                prizeImage.enabled = true;
+            }
+            else ApplyFallback();
+        }));
+
+        if (offline) Debug.LogWarning("[PrizeManager] Prêmio resolvido offline — será confirmado quando voltar online.");
     }
 
     private void ApplyFallback()
     {
-        if (fallbackSprite != null)
-        {
-            prizeImage.sprite = fallbackSprite;
-            prizeImage.enabled = true;
-            Debug.LogWarning("Aplicando imagem de fallback.");
-        }
-        else
-        {
-            prizeImage.enabled = false;
-            Debug.LogError("Imagem de fallback não configurada e imagem real não pôde ser carregada.");
-        }
+        if (prizeImage == null) return;
+        prizeImage.enabled = true; // nunca desabilita o componente — fica visível mesmo sem sprite
+        if (fallbackSprite != null) prizeImage.sprite = fallbackSprite;
+        else Debug.LogWarning("[PrizeManager] Imagem do brinde não pôde ser carregada e fallbackSprite não está configurado no inspector.");
     }
 
-    // NOVO: Corrotina para carregar a imagem do cache local
-    private IEnumerator LoadImageFromCache(string url)
+    private void HandleNoPrize(string reason)
     {
-        TotemApiClient apiClient = TotemApiClient.Instance;
-        string localPath = apiClient.GetLocalImagePath(url);
-        Texture2D texture = null;
+        Debug.LogWarning($"[PrizeManager] Sem prêmio. Motivo: {reason}");
+        OnNoPrize?.Invoke(reason);
 
-        // 1. Tenta carregar do cache local
-        if (System.IO.File.Exists(localPath))
+        if (noPrizePanel != null) noPrizePanel.SetActive(true);
+        if (!string.IsNullOrEmpty(noPrizeSceneName)) UnityEngine.SceneManagement.SceneManager.LoadScene(noPrizeSceneName);
+    }
+
+    private bool EnsureApi()
+    {
+        if (ApiController.Instance == null)
         {
-            Debug.Log($"Carregando imagem do cache: {localPath}");
-            try
-            {
-                byte[] fileData = System.IO.File.ReadAllBytes(localPath);
-                texture = new Texture2D(2, 2);
-                if (texture.LoadImage(fileData)) // Carrega a imagem do array de bytes
-                {
-                    ApplyTextureToImage(texture);
-                    yield break; // Imagem carregada do cache, finaliza
-                }
-            }
-            catch (System.Exception e)
-            {
-                Debug.LogError($"Falha ao carregar imagem do cache ({e.Message}). Aplicando fallback.");
-            }
+            Debug.LogError("[PrizeManager] ApiController.Instance ausente. Coloque ApiController numa cena anterior.");
+            return false;
         }
-
-        // Se chegou aqui, o cache falhou ou não existe.
-        ApplyFallback();
-        yield break;
+        return true;
     }
 }
+
+// UnityEvents customizados aparecem no Inspector quando declarados como classes nomeadas.
+[Serializable] public class GiftEvent : UnityEvent<Gift> { }
+[Serializable] public class NoPrizeEvent : UnityEvent<string> { }
+[Serializable] public class ChanceEvent : UnityEvent<ChanceData> { }

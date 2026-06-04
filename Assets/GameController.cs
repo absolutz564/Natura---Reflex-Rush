@@ -59,7 +59,7 @@ public class GameController : MonoBehaviour
     public bool canFade = true;
     public int minScore = 80;
 
-    public TotemApiClient api;
+    private float roundStartTime;
 
     public void ResetFadeState()
     {
@@ -150,17 +150,11 @@ public class GameController : MonoBehaviour
     IEnumerator WaitToStartFade()
     {
         yield return new WaitForSeconds(1);
-        if (api == null)
-        {
-            api = TotemApiClient.Instance;
-            Debug.Log("Buscou api ", api);
-            DebugTotemApi();
-        }
-
-        if (api != null && api.GameTime > 0)
-            gameTime = api.GameTime;
+        if (ApiController.Instance != null && ApiController.Instance.CurrentGameDurationSec > 0)
+            gameTime = ApiController.Instance.CurrentGameDurationSec;
         else
             gameTime = 30;
+        Debug.Log($"[GameController] gameTime resolvido: {gameTime}s");
         StartCoroutine(FadeObject());
     }
 
@@ -173,44 +167,11 @@ public class GameController : MonoBehaviour
         }
 
         LoadGameMinScore();
+        LoadUpdatedConfig();
     }
 
     public void LoadUpdatedConfig() {
         StartCoroutine(WaitToStartFade());
-    }
-
-    void DebugTotemApi()
-    {
-        Debug.Log("======= API DEBUG =======");
-        Debug.Log($"Difficulty: {api.CurrentDifficulty}");
-        Debug.Log($"GameTime: {api.GameTime}");
-        Debug.Log($"Raw JSON:\n{api.LastStockJson}");
-
-        if (api.StockItems == null)
-        {
-            Debug.Log("StockItems = NULL");
-            return;
-        }
-        string difficulty = api.CurrentDifficulty.ToUpper();
-        Debug.Log($"Difficulty: {difficulty}");
-        if (difficulty == "EASY") {
-            SetGameSpeed(2.0f);
-        } else if (difficulty == "NORMAL") {
-            SetGameSpeed(1.5f);
-        } else if (difficulty == "HARD") {
-            SetGameSpeed(1.0f);
-        } else if (difficulty == "EXTREME") {
-            SetGameSpeed(0.8f);
-        }
-
-        Debug.Log($"StockItems Count: {api.StockItems.Count}");
-
-        foreach (var i in api.StockItems)
-        {
-            Debug.Log($"[ITEM] {i.name} | Total={i.totalStock} | Remaining={i.remaining} | Id={i.giftId}");
-        }
-
-        Debug.Log("=========================");
     }
 
     public void SetGameSpeed(float newSpeed)
@@ -253,6 +214,7 @@ public class GameController : MonoBehaviour
         misses = 0;
         Life.sprite = LifeSprites[misses];
         gameEnded = false;
+        roundStartTime = Time.time;
         DisableAllButtons();
         gameCoroutine = StartCoroutine(GameLoop());
         buttonCoroutine = StartCoroutine(ActivateRandomButton());
@@ -320,14 +282,26 @@ public class GameController : MonoBehaviour
         gameEnded = true;
         DisableAllButtons();
 
-        if (score >= minScore)
+        if (PrizeManager.Instance == null)
         {
-            ShowWinner();
+            Debug.LogError("[GameController] PrizeManager.Instance ausente — fallback pra gate local.");
+            if (score >= minScore) ShowWinner(); else ShowGameOver();
+            return;
         }
-        else
+
+        // Servidor decide se ganhou prêmio. Cliente só reporta o score real.
+        PrizeManager.Instance.OnPrizeAwarded.RemoveAllListeners();
+        PrizeManager.Instance.OnNoPrize.RemoveAllListeners();
+        PrizeManager.Instance.OnPrizeAwarded.AddListener(_ => ShowWinner());
+        PrizeManager.Instance.OnNoPrize.AddListener(reason =>
         {
+            Debug.Log($"[GameController] Sem prêmio. Motivo: {reason}");
             ShowGameOver();
-        }
+        });
+
+        PrizeManager.LastGameDurationSeconds = Time.time - roundStartTime;
+        int scoreToSend = Mathf.Max(0, score);
+        PrizeManager.Instance.AwardPrize(score: scoreToSend);
     }
 
     void ShowWinner()
@@ -443,7 +417,8 @@ public class GameController : MonoBehaviour
     void MissedButton()
     {
         misses++;
-        Life.sprite = LifeSprites[misses];
+        int spriteIndex = Mathf.Clamp(misses, 0, LifeSprites.Length - 1);
+        Life.sprite = LifeSprites[spriteIndex];
         if (score - penaltyPerMiss >= 0) {
             score -= penaltyPerMiss;
         } else {
