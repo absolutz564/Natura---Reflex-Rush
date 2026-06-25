@@ -55,6 +55,9 @@ public class PrizeManager : MonoBehaviour
 
     [Header("Eventos")]
     public GiftEvent OnPrizeAwarded;
+    [Tooltip("Dispara DEPOIS que a imagem do prêmio terminou de carregar (ou caiu no fallback em erro). " +
+             "Use este para abrir a tela de vitória só com a imagem pronta.")]
+    public GiftEvent OnPrizeReady;
     public NoPrizeEvent OnNoPrize;
     public ChanceEvent OnChanceLoaded;
 
@@ -76,6 +79,7 @@ public class PrizeManager : MonoBehaviour
         // UnityEvents só são inicializados automaticamente quando vêm do Inspector.
         // Como o componente pode ser adicionado em runtime (AddComponent), garantimos aqui.
         if (OnPrizeAwarded == null) OnPrizeAwarded = new GiftEvent();
+        if (OnPrizeReady == null)  OnPrizeReady  = new GiftEvent();
         if (OnNoPrize == null)     OnNoPrize     = new NoPrizeEvent();
         if (OnChanceLoaded == null) OnChanceLoaded = new ChanceEvent();
     }
@@ -213,14 +217,22 @@ public class PrizeManager : MonoBehaviour
         if (prizeNameText != null)
             prizeNameText.text = gift.name ?? "";
 
-        if (prizeImage == null) return;
+        // Sem componente de imagem — nada pra baixar, já está "pronto".
+        if (prizeImage == null)
+        {
+            OnPrizeReady?.Invoke(gift);
+            return;
+        }
 
         // Sem URL na resposta — mantém fallback (alguns endpoints não devolvem imageUrl).
         if (string.IsNullOrEmpty(gift.imageUrl))
         {
             ApplyFallback();
+            OnPrizeReady?.Invoke(gift);
             return;
         }
+
+        if (offline) Debug.LogWarning("[PrizeManager] Prêmio resolvido offline — será confirmado quando voltar online.");
 
         StartCoroutine(ApiController.Instance.GetGiftImage(gift, sp =>
         {
@@ -229,10 +241,11 @@ public class PrizeManager : MonoBehaviour
                 prizeImage.sprite = sp;
                 prizeImage.enabled = true;
             }
-            else ApplyFallback();
-        }));
+            else ApplyFallback();   // erro/timeout → usa fallback, mas considera "pronto"
 
-        if (offline) Debug.LogWarning("[PrizeManager] Prêmio resolvido offline — será confirmado quando voltar online.");
+            // Só agora a imagem (real ou fallback) está pronta na tela.
+            OnPrizeReady?.Invoke(gift);
+        }));
     }
 
     private void ApplyFallback()

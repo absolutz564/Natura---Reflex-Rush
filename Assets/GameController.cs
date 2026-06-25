@@ -290,9 +290,11 @@ public class GameController : MonoBehaviour
         }
 
         // Servidor decide se ganhou prêmio. Cliente só reporta o score real.
-        PrizeManager.Instance.OnPrizeAwarded.RemoveAllListeners();
+        PrizeManager.Instance.OnPrizeReady.RemoveAllListeners();
         PrizeManager.Instance.OnNoPrize.RemoveAllListeners();
-        PrizeManager.Instance.OnPrizeAwarded.AddListener(_ => ShowWinner());
+        // Vitória: abre a tela só quando a imagem do prêmio já carregou (ou caiu no fallback).
+        PrizeManager.Instance.OnPrizeReady.AddListener(_ => ShowWinner());
+        // Derrota: não depende de imagem, abre imediatamente.
         PrizeManager.Instance.OnNoPrize.AddListener(reason =>
         {
             Debug.Log($"[GameController] Sem prêmio. Motivo: {reason}");

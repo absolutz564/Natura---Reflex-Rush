@@ -100,6 +100,39 @@ public class PreviewCandidate
 }
 
 [Serializable]
+public class TierCalibration
+{
+    public ScoreRange scoreRange;
+    public int discreteValue;
+}
+
+[Serializable]
+public class PoolGift
+{
+    public string giftId;
+    public string giftName;
+    public int configuredWeight;
+    public int remainingStock;      // estoque disponível — base pra premiação offline
+    public int effectiveWeight;
+    public float chancePctInTier;
+}
+
+[Serializable]
+public class PreviewTier
+{
+    public string tierId;
+    public string tierLabel;
+    public int sortOrder;
+    public string outcomeType;
+    public TierCalibration calibration;
+    public bool isTargetThisRound;
+    public bool eligible;
+    public float selectionChancePct;
+    public int poolTotalWeight;
+    public List<PoolGift> poolGifts;
+}
+
+[Serializable]
 public class PreviewData
 {
     public string gameType;
@@ -109,6 +142,8 @@ public class PreviewData
     public int discreteValue;
     public PreviewCandidate preview;
     public PeriodInfo period;
+    public string calibrationSessionId; // sessão de calibração — devolvida no complete
+    public List<PreviewTier> tiers;     // faixas com estoque por brinde (controle offline)
 }
 [Serializable] public class PreviewEnvelope : ApiEnvelopeBase { public PreviewData data; }
 
@@ -148,6 +183,7 @@ public class PendingRound
     public int discreteOutcome;
     public bool hasScore;
     public bool hasDiscrete;
+    public string calibrationSessionId; // sessão do preview, devolvida no complete
     public RoundMetadata metadata;
 }
 
@@ -206,17 +242,28 @@ public class ApiController : MonoBehaviour
     [Tooltip("Segundos durante os quais o cache é servido sem revalidar com o servidor. Default: 1h.")]
     public float imageCacheTtlSec = 3600f;
 
+    [Header("Logs")]
+    [Tooltip("Máximo de caracteres do corpo HTTP impresso no log. Acima disso, corta com '…'. 0 = sem limite.")]
+    public int logBodyMaxChars = 4000;
+
+    // Atalho seguro: 0 (ou negativo) no Inspector significa "sem limite".
+    private int LogBodyMaxChars => logBodyMaxChars > 0 ? logBodyMaxChars : int.MaxValue;
+
     // Último preview por gameType — usado pra resolver offline e pra UI.
     private readonly Dictionary<string, PreviewData> previewByGameType = new Dictionary<string, PreviewData>();
 
     // Fila de rounds que ainda não foram confirmados pelo servidor.
     private List<PendingRound> pendingRounds = new List<PendingRound>();
 
+    // Evita que o ping loop e o pre-sync do preview disparem o batch ao mesmo tempo.
+    private bool isFlushing;
+
     private const string PENDING_FILE = "pending_rounds.json";
     private const string LAST_PREVIEWS_FILE = "last_previews.json";
     private const string LAST_HEALTH_FILE = "last_health.json";
     private const string IMG_META_FILE = "image_cache_meta.json";
     private const string OFFLINE_HINTS_FILE = "offline_gift_hints.json";
+    private const string GIFT_IMG_MAP_FILE = "gift_image_map.json";
 
     // Caches de imagem (memória + metadata persistida em disco)
     private readonly Dictionary<string, Sprite> imageMemCache = new Dictionary<string, Sprite>();
@@ -224,6 +271,10 @@ public class ApiController : MonoBehaviour
 
     // Histórico de gifts vistos em rodadas online — chave: gameType + tierId
     private List<OfflineGiftHint> giftHints = new List<OfflineGiftHint>();
+
+    // Mapa giftId → imageUrl, aprendido de rodadas online. Usado pra recuperar a imagem
+    // (já cacheada em disco pela URL) na premiação offline, onde os poolGifts não trazem URL.
+    private readonly Dictionary<string, string> giftImageUrlById = new Dictionary<string, string>();
 
     private ApiConfig config;
 
@@ -244,11 +295,59 @@ public class ApiController : MonoBehaviour
             TryLaunchConfigurator();
         }
 
+        // Invalida caches de premiação de uma ativação anterior (unityKey diferente)
+        // ANTES de carregá-los, pra nunca premiar com produto de outro evento/dia.
+        EnforceActivationScope();
+
         LoadPendingRounds();
         LoadCachedPreviews();
         LoadCachedHealth();
         LoadImageMetaCache();
         LoadGiftHints();
+        LoadGiftImageMap();
+    }
+
+    private const string ACTIVATION_MARKER_FILE = "offline_activation.json";
+
+    // Escopa os caches offline de premiação à ativação atual (unityKey). Se o unityKey mudou
+    // desde a última execução — ou se não há marcador (instalação legada) — apaga os caches
+    // aprendidos (hints, previews, mapa de imagem) pra não usar dados de outra ativação.
+    // Não toca em pending_rounds (não perde rodadas a sincronizar).
+    private void EnforceActivationScope()
+    {
+        if (config == null || string.IsNullOrEmpty(config.unityKey)) return;
+
+        string current = HashKey(config.unityKey);
+        string markerPath = GetLocalPath(ACTIVATION_MARKER_FILE);
+
+        string previous = null;
+        try { if (File.Exists(markerPath)) previous = File.ReadAllText(markerPath).Trim(); }
+        catch (Exception e) { Debug.LogWarning($"[Activation] ler marcador: {e.Message}"); }
+
+        if (previous == current) return; // mesma ativação — mantém os caches
+
+        Debug.LogWarning("[Activation] unityKey novo/alterado — descartando caches offline de premiação da ativação anterior.");
+        SafeDelete(GetLocalPath(OFFLINE_HINTS_FILE));
+        SafeDelete(GetLocalPath(LAST_PREVIEWS_FILE));
+        SafeDelete(GetLocalPath(GIFT_IMG_MAP_FILE));
+
+        try { File.WriteAllText(markerPath, current); }
+        catch (Exception e) { Debug.LogError($"[Activation] gravar marcador: {e.Message}"); }
+    }
+
+    private static string HashKey(string s)
+    {
+        using (var sha = SHA256.Create())
+        {
+            byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+            return BitConverter.ToString(h).Replace("-", "").ToLowerInvariant();
+        }
+    }
+
+    private static void SafeDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (Exception e) { Debug.LogWarning($"[Activation] apagar {path}: {e.Message}"); }
     }
 
     void Start()
@@ -310,10 +409,31 @@ public class ApiController : MonoBehaviour
         });
     }
 
+    /// Retorna o último preview cacheado pra um gameType (ou null se não houver).
+    /// Usado pelo gerenciador pra decidir o outcome/estoque offline.
+    public PreviewData GetCachedPreview(string gameType)
+    {
+        return previewByGameType.TryGetValue(gameType, out var p) ? p : null;
+    }
+
     /// GET /v2/unity/round/preview?gameType=... — preview sem consumir estoque.
     /// O resultado é cacheado por gameType pra uso offline.
     public IEnumerator GetPreview(string gameType, Action<PreviewData> callback)
     {
+        // Opção 1 (à prova de estoque inflado): se há rodadas offline pendentes, sincroniza o
+        // batch ANTES de pedir o preview. Assim o servidor já contabilizou as premiações offline
+        // e devolve o estoque correto (senão o preview sobrescreveria os decrementos locais com
+        // um estoque maior do que o real). Roda só quando há pendências (caso raro).
+        if (pendingRounds.Count > 0)
+        {
+            yield return PingHealth();           // confirma conectividade (rápido quando online)
+            if (IsOnline)
+            {
+                Debug.Log($"[Preview] {pendingRounds.Count} rodada(s) offline pendente(s) — sincronizando batch antes do preview.");
+                yield return FlushPendingBatch();
+            }
+        }
+
         string ep = $"/v2/unity/round/preview?gameType={UnityWebRequest.EscapeURL(gameType)}";
         yield return SendRequest(ep, "GET", null, raw =>
         {
@@ -352,6 +472,8 @@ public class ApiController : MonoBehaviour
             discreteOutcome = discreteOutcome ?? 0,
             hasScore = score.HasValue,
             hasDiscrete = discreteOutcome.HasValue,
+            calibrationSessionId = previewByGameType.TryGetValue(gameType, out var pvSession)
+                ? pvSession?.calibrationSessionId : null,
             metadata = new RoundMetadata { durationSec = durationSec }
         };
 
@@ -551,18 +673,46 @@ public class ApiController : MonoBehaviour
     // ----------- Resolução offline -----------
     private CompleteData BuildOfflineResolution(string gameType, int? score, int? discreteOutcome)
     {
-        // 1ª escolha: hint aprendido de rodada online — mais preciso (cobre o score real).
+        // Jogos discretos (JACKPOT/ROLETA): resolve pelas FAIXAS do preview cacheado,
+        // respeitando estoque. Prefere o tier pedido; se sem estoque, cai pro discreteValue 0
+        // e depois pros demais. Nunca premia brinde sem estoque.
+        if (discreteOutcome.HasValue && !score.HasValue)
+        {
+            previewByGameType.TryGetValue(gameType, out var pv);
+            if (pv?.tiers != null && pv.tiers.Count > 0)
+                return BuildOfflineFromTiers(gameType, pv, discreteOutcome.Value);
+        }
+
+        // Jogos por SCORE (SCORE_ENDLESS): SEM internet premia sempre pela faixa mais baixa
+        // (como se fosse pontuação 0), respeitando estoque. Se não houver pool/estoque utilizável
+        // no preview, retorna null e cai pro hint/preview aprendido online (abaixo).
         if (score.HasValue)
         {
+            previewByGameType.TryGetValue(gameType, out var pvScore);
+            if (pvScore?.tiers != null && pvScore.tiers.Count > 0)
+            {
+                var byScore = BuildOfflineFromTiersByScore(gameType, pvScore, score.Value);
+                if (byScore != null) return byScore;
+            }
+        }
+
+        // Fallback pra SCORE quando o preview não trouxe pool utilizável (poolGifts vazios):
+        // como offline é SEMPRE a faixa base (consolação), resolvemos pelo hint da banda MAIS BAIXA
+        // (pontuação mínima), aprendido de uma rodada online — NÃO pelo score real do jogador.
+        if (score.HasValue)
+        {
+            int baseScore = LowestBandMin(gameType);   // ex.: 0 (Faixa 1)
+
             var hint = giftHints.FirstOrDefault(h =>
                 h.gameType == gameType &&
-                score.Value >= h.scoreMin &&
-                score.Value <= h.scoreMax &&
+                baseScore >= h.scoreMin &&
+                baseScore <= h.scoreMax &&
                 h.gift != null);
 
             if (hint != null)
             {
-                Debug.Log($"[Offline] Resolvendo via hint: tier={hint.tierLabel} gift={hint.gift.name} band=[{hint.scoreMin},{hint.scoreMax}]");
+                Debug.Log($"[Offline] SCORE consolação via hint da faixa base (score real={score} ignorado): " +
+                          $"tier={hint.tierLabel} gift={hint.gift.name} band=[{hint.scoreMin},{hint.scoreMax}]");
                 return new CompleteData
                 {
                     tierId = hint.tierId,
@@ -597,7 +747,8 @@ public class ApiController : MonoBehaviour
             gift = new Gift
             {
                 id = preview.preview.candidateGiftId,
-                name = preview.preview.candidateGiftName
+                name = preview.preview.candidateGiftName,
+                imageUrl = GetKnownImageUrl(preview.preview.candidateGiftId)
             },
             resolvedFrom = new ResolvedFrom
             {
@@ -609,6 +760,133 @@ public class ApiController : MonoBehaviour
             resolvedOffline = true,
             code = "OFFLINE_OK_PREVIEW"
         };
+    }
+
+    // ===== Premiação offline pelas FAIXAS do preview, respeitando estoque =====
+    // Comum aos dois tipos de jogo; só muda a forma de escolher a faixa-alvo.
+
+    // DISCRETO (JACKPOT/ROLETA): tier pedido → discreteValue 0 → demais (por sortOrder).
+    private CompleteData BuildOfflineFromTiers(string gameType, PreviewData pv, int requestedDiscrete)
+    {
+        // Monta a ordem de preferência sem repetir discreteValue.
+        var order = new List<int>();
+        void AddDv(int dv) { if (!order.Contains(dv)) order.Add(dv); }
+
+        AddDv(requestedDiscrete);   // 1º: a faixa que o gerenciador decidiu
+        AddDv(0);                   // 2º: regra do negócio — offline sempre tende ao discreteValue 0
+        foreach (var t in pv.tiers.OrderBy(t => t.sortOrder))
+            if (t.calibration != null) AddDv(t.calibration.discreteValue);
+
+        foreach (int dv in order)
+        {
+            PreviewTier tier = FindTierByDiscrete(pv, dv);
+            PoolGift pick = PickInStockGift(tier);
+            if (pick == null) continue;
+
+            var resolved = new ResolvedFrom { score = 0, discreteOutcome = dv, band = null };
+            return AwardOfflineFromTier(tier, pick, resolved, fallback: dv != requestedDiscrete, ctx: $"dv={dv}");
+        }
+
+        Debug.LogWarning("[Offline] Nenhuma faixa com estoque disponível. Sem prêmio.");
+        return new CompleteData { gift = null, resolvedOffline = true, code = "OFFLINE_NO_STOCK" };
+    }
+
+    // SCORE (SCORE_ENDLESS): SEM internet, premia SEMPRE pela FAIXA MAIS BAIXA (sortOrder 0,
+    // como se fosse pontuação 0), independente do score real do jogador. Se a faixa mais baixa
+    // estiver sem estoque, sobe pra próxima até achar disponível (não há nada abaixo da base).
+    // Retorna null se nenhuma faixa tiver estoque (ex.: poolGifts vazios) → o chamador cai pro
+    // hint/preview aprendido online.
+    private CompleteData BuildOfflineFromTiersByScore(string gameType, PreviewData pv, int score)
+    {
+        // Faixas ordenadas por sortOrder ASC (0 = base/mais baixa).
+        var sorted = pv.tiers.Where(t => t.calibration != null).OrderBy(t => t.sortOrder).ToList();
+        if (sorted.Count == 0) return null;
+
+        // Começa na faixa mais baixa e sobe até encontrar estoque.
+        for (int i = 0; i < sorted.Count; i++)
+        {
+            PreviewTier tier = sorted[i];
+            PoolGift pick = PickInStockGift(tier);
+            if (pick == null) continue;
+
+            var band = tier.calibration.scoreRange;
+            var resolved = new ResolvedFrom { score = score, discreteOutcome = 0, band = band };
+            return AwardOfflineFromTier(tier, pick, resolved, fallback: i != 0, ctx: $"faixa-base (score real={score} ignorado)");
+        }
+
+        // Nenhuma faixa com estoque utilizável (ex.: poolGifts vazios no preview).
+        Debug.LogWarning("[Offline] SCORE: nenhuma faixa com estoque no preview — caindo pro hint/preview.");
+        return null;
+    }
+
+    // Consome estoque, persiste, resolve a imagem e monta o CompleteData. Comum aos dois tipos.
+    private CompleteData AwardOfflineFromTier(PreviewTier tier, PoolGift pick, ResolvedFrom resolved, bool fallback, string ctx)
+    {
+        // Consome 1 do estoque local e persiste, pra não premiar além do disponível
+        // em rodadas offline subsequentes (até um novo preview online sobrescrever).
+        pick.remainingStock = Mathf.Max(0, pick.remainingStock - 1);
+        SaveCachedPreviews();
+
+        // Recupera a imageUrl aprendida de uma rodada online anterior (poolGifts não trazem URL).
+        // Se nunca saiu online, fica null → a UI usa o fallbackSprite.
+        string imageUrl = GetKnownImageUrl(pick.giftId);
+
+        Debug.Log($"[Offline] Premiando via estoque: tier={tier.tierLabel} ({ctx}{(fallback ? ", FALLBACK" : "")}) " +
+                  $"gift={pick.giftName} estoqueRestante={pick.remainingStock} img={(string.IsNullOrEmpty(imageUrl) ? "—" : "cache")}");
+
+        return new CompleteData
+        {
+            tierId = tier.tierId,
+            tierLabel = tier.tierLabel,
+            gift = new Gift { id = pick.giftId, name = pick.giftName, imageUrl = imageUrl },
+            resolvedFrom = resolved,
+            stockRemainingForGift = pick.remainingStock,
+            resolvedOffline = true,
+            code = fallback ? "OFFLINE_OK_STOCK_FALLBACK" : "OFFLINE_OK_STOCK"
+        };
+    }
+
+    private static PreviewTier FindTierByDiscrete(PreviewData pv, int discreteValue)
+    {
+        if (pv?.tiers == null) return null;
+        return pv.tiers.FirstOrDefault(t => t.calibration != null && t.calibration.discreteValue == discreteValue);
+    }
+
+    // Pontuação mínima da faixa base (menor sortOrder) do preview cacheado. 0 se não houver.
+    // Usado pra resolver SCORE offline sempre como "faixa de consolação".
+    private int LowestBandMin(string gameType)
+    {
+        if (previewByGameType.TryGetValue(gameType, out var pv) && pv?.tiers != null)
+        {
+            var lowest = pv.tiers
+                .Where(t => t.calibration != null && t.calibration.scoreRange != null)
+                .OrderBy(t => t.sortOrder)
+                .FirstOrDefault();
+            if (lowest != null) return lowest.calibration.scoreRange.min;
+        }
+        return 0;
+    }
+
+    // Sorteia um brinde COM estoque dentro da faixa, ponderado por effectiveWeight.
+    // Retorna null se a faixa não existe ou está sem estoque.
+    private static PoolGift PickInStockGift(PreviewTier tier)
+    {
+        if (tier?.poolGifts == null) return null;
+
+        var inStock = tier.poolGifts.Where(g => g != null && g.remainingStock > 0).ToList();
+        if (inStock.Count == 0) return null;
+
+        // Peso: effectiveWeight (cai pro configuredWeight, e por fim 1).
+        long total = 0;
+        foreach (var g in inStock) total += Mathf.Max(1, g.effectiveWeight > 0 ? g.effectiveWeight : g.configuredWeight);
+
+        long r = (long)(UnityEngine.Random.value * total);
+        foreach (var g in inStock)
+        {
+            r -= Mathf.Max(1, g.effectiveWeight > 0 ? g.effectiveWeight : g.configuredWeight);
+            if (r < 0) return g;
+        }
+        return inStock[inStock.Count - 1];
     }
 
     private void RememberGiftHint(string gameType, CompleteData data)
@@ -651,6 +929,60 @@ public class ApiController : MonoBehaviour
             Debug.Log($"[Offline] hints carregados: {giftHints.Count}");
         }
         catch (Exception e) { Debug.LogError($"[Offline] load hints: {e.Message}"); giftHints = new List<OfflineGiftHint>(); }
+    }
+
+    // ----------- Mapa giftId → imageUrl (pra imagem offline) -----------
+
+    // Memoriza a URL da imagem de um brinde premiado online. A imagem em si já é
+    // baixada/cacheada em disco pelo GetGiftImage; aqui guardamos só a chave (URL) por giftId.
+    private void RememberGiftImage(Gift gift)
+    {
+        if (gift == null || string.IsNullOrEmpty(gift.id) || string.IsNullOrEmpty(gift.imageUrl)) return;
+
+        if (giftImageUrlById.TryGetValue(gift.id, out var existing) && existing == gift.imageUrl)
+            return; // já conhecido, evita reescrever o arquivo
+
+        giftImageUrlById[gift.id] = gift.imageUrl;
+        SaveGiftImageMap();
+    }
+
+    // Retorna a imageUrl conhecida pra um giftId (ou null se nunca vista online).
+    private string GetKnownImageUrl(string giftId)
+    {
+        if (string.IsNullOrEmpty(giftId)) return null;
+        return giftImageUrlById.TryGetValue(giftId, out var url) ? url : null;
+    }
+
+    [Serializable] private class GiftImageEntry { public string giftId; public string imageUrl; }
+    [Serializable] private class GiftImageMapWrapper { public List<GiftImageEntry> entries; }
+
+    private void SaveGiftImageMap()
+    {
+        try
+        {
+            var w = new GiftImageMapWrapper
+            {
+                entries = giftImageUrlById.Select(kv => new GiftImageEntry { giftId = kv.Key, imageUrl = kv.Value }).ToList()
+            };
+            File.WriteAllText(GetLocalPath(GIFT_IMG_MAP_FILE), JsonUtility.ToJson(w));
+        }
+        catch (Exception e) { Debug.LogError($"[GiftImgMap] save: {e.Message}"); }
+    }
+
+    private void LoadGiftImageMap()
+    {
+        string path = GetLocalPath(GIFT_IMG_MAP_FILE);
+        if (!File.Exists(path)) return;
+        try
+        {
+            var w = JsonUtility.FromJson<GiftImageMapWrapper>(File.ReadAllText(path));
+            if (w?.entries != null)
+                foreach (var e in w.entries)
+                    if (!string.IsNullOrEmpty(e.giftId) && !string.IsNullOrEmpty(e.imageUrl))
+                        giftImageUrlById[e.giftId] = e.imageUrl;
+            Debug.Log($"[GiftImgMap] carregados: {giftImageUrlById.Count}");
+        }
+        catch (Exception e) { Debug.LogError($"[GiftImgMap] load: {e.Message}"); }
     }
 
     // ----------- Ping periódico + sync -----------
@@ -702,7 +1034,8 @@ public class ApiController : MonoBehaviour
 
     private IEnumerator FlushPendingBatch()
     {
-        if (pendingRounds.Count == 0) yield break;
+        if (isFlushing || pendingRounds.Count == 0) yield break;
+        isFlushing = true;
 
         // API aceita até 100 por request. Vou enviar em chunks de 50 por segurança.
         const int CHUNK = 50;
@@ -718,6 +1051,7 @@ public class ApiController : MonoBehaviour
             if (string.IsNullOrEmpty(raw) || raw.StartsWith("ERRO"))
             {
                 Debug.LogWarning("[Batch] Falha — mantendo pendentes.");
+                isFlushing = false;
                 yield break; // tenta no próximo ciclo
             }
 
@@ -739,6 +1073,8 @@ public class ApiController : MonoBehaviour
                 Debug.Log($"[Batch] {confirmedIds.Count} confirmados. Pendentes restantes: {pendingRounds.Count}");
             }
         }
+
+        isFlushing = false;
     }
 
     private bool IsTerminalFailureCode(string code)
@@ -783,7 +1119,7 @@ public class ApiController : MonoBehaviour
 
         if (method != "GET" && !string.IsNullOrEmpty(jsonBody))
         {
-            string reqPreview = jsonBody.Length > 400 ? jsonBody.Substring(0, 400) + "…" : jsonBody;
+            string reqPreview = jsonBody.Length > LogBodyMaxChars ? jsonBody.Substring(0, LogBodyMaxChars) + "…" : jsonBody;
             Debug.Log($"[HTTP] → {method} {endpoint} body={reqPreview}");
         }
         else
@@ -803,7 +1139,7 @@ public class ApiController : MonoBehaviour
 
         IsOnline = true;
         string respBody = req.downloadHandler.text ?? "";
-        string preview = respBody.Length > 400 ? respBody.Substring(0, 400) + "…" : respBody;
+        string preview = respBody.Length > LogBodyMaxChars ? respBody.Substring(0, LogBodyMaxChars) + "…" : respBody;
         Debug.Log($"[HTTP] ← {method} {endpoint} {req.responseCode} body={preview}");
         callback?.Invoke(respBody);
     }
@@ -825,6 +1161,7 @@ public class ApiController : MonoBehaviour
                 env.data.code = string.IsNullOrEmpty(env.code) ? "OK" : env.code;
                 env.data.message = env.message;
                 RememberGiftHint(gameType, env.data);
+                RememberGiftImage(env.data.gift);
                 return env.data;
             }
 
@@ -848,6 +1185,8 @@ public class ApiController : MonoBehaviour
         sb.Append($"\"clientRoundId\":\"{Escape(p.clientRoundId)}\"");
         if (p.hasScore) sb.Append($",\"score\":{p.score}");
         if (p.hasDiscrete) sb.Append($",\"discreteOutcome\":{p.discreteOutcome}");
+        if (!string.IsNullOrEmpty(p.calibrationSessionId))
+            sb.Append($",\"calibrationSessionId\":\"{Escape(p.calibrationSessionId)}\"");
         sb.Append($",\"metadata\":{{\"durationSec\":{p.metadata.durationSec}}}");
         sb.Append("}");
         return sb.ToString();
